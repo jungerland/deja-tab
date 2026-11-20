@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""deja-tab: snapshot your open Claude Code sessions, and bring them back
+into iTerm2 after a restart.
+
+Usage:
+    deja-tab snapshot            capture what is open right now
+    deja-tab list [manifest]     show a captured snapshot
+    deja-tab restore [manifest]  resume each session in its old tab
+        --dry-run                print the commands, type nothing
+        --delay N                seconds between tabs (default 1.5)
+        --title-delay N          wait before naming tabs (default 8)
+
+With no manifest argument, the newest snapshot is used.
+
+Window names, tabs, and tab groups come back through an iTerm2 window
+arrangement named "claude-sessions" (override with DEJA_TAB_ARRANGEMENT).
+AppleScript cannot save or restore arrangements, so:
+
+    1. Window > Save Window Arrangement, name it claude-sessions
+    2. deja-tab snapshot
+    ... restart ...
+    3. Nothing: with Settings > General > Startup > Open Default Window
+       Arrangement, and claude-sessions as the default, iTerm2 reopens the
+       windows at launch. Restoring it by hand as well opens every window twice.
+    4. deja-tab restore
+"""
+
+import argparse
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+SNAP_DIR = os.path.expanduser("~/.claude/session-snapshots")
+REGISTRY = os.path.expanduser("~/.claude/sessions")
+# Variables a parent Claude session hands to its children. A tab that inherits
+# them (e.g. iTerm2 launched from a Claude shell) turns off transcript saving.
+INHERITED_CLAUDE_VARS = ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+                         "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_ENTRYPOINT",
+                         "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+                         "CLAUDE_CODE_EXECPATH")
+UNSET_INHERITED = "unset " + " ".join(INHERITED_CLAUDE_VARS) + "; "
+ARRANGEMENT = os.environ.get("DEJA_TAB_ARRANGEMENT", "claude-sessions")
+PREFS_NAME = "com.googlecode.iterm2.plist"
+DEFAULT_PREFS = os.path.expanduser(f"~/Library/Preferences/{PREFS_NAME}")
+
+
+def proc_start(pid):
+    """Return the process start time, or None when the pid is not running."""
+    r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or None
+
+
+def proc_tty(pid):
+    """The tty is how you find a session's tab while it is still running."""
+    r = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
+                       capture_output=True, text=True)
+    t = r.stdout.strip()
+    return f"/dev/{t}" if t and t != "??" else None
+
+
+def session_title(session_id):
+    """The tab title Claude Code shows: last /rename, else last auto-generated title."""
+    root = os.path.expanduser("~/.claude/projects")
+    for dirpath, _dirs, files in os.walk(root):
+        if f"{session_id}.jsonl" not in files:
+            continue
+        custom = ai = None
+        with open(os.path.join(dirpath, f"{session_id}.jsonl")) as fh:
+            for line in fh:
+                if '"custom-title"' not in line and '"ai-title"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") == "custom-title":
+                    custom = d.get("customTitle") or custom
+                elif d.get("type") == "ai-title":
+                    ai = d.get("aiTitle") or ai
+        return custom or ai
+    return None
+
+
+def transcript_exists(session_id):
+    """A session with no transcript on disk cannot be --resume'd."""
+    root = os.path.expanduser("~/.claude/projects")
+    for dirpath, _dirs, files in os.walk(root):
+        if f"{session_id}.jsonl" in files:
+            return True
+    return False
+
+
+def iterm_position(pid):
+    """Pull window/tab/pane out of ITERM_SESSION_ID, e.g. w1t40p0."""
+    r = subprocess.run(["ps", "-Ewwp", str(pid)], capture_output=True, text=True)
+    for tok in r.stdout.split():
+        if tok.startswith("ITERM_SESSION_ID="):
+            loc = tok.split("=", 1)[1].split(":", 1)[0]
+            try:
+                w, rest = loc[1:].split("t", 1)
+                t, p = rest.split("p", 1)
+                return {"window": int(w), "tab": int(t), "pane": int(p)}
+            except ValueError:
+                return None
+    return None
+
+
+def iterm_windows():
+    """Every iTerm2 window as {id, name, tabs}, where tabs is a list of tab
+    entries and each tab entry is the list of its panes' ttys."""
+    script = ('tell application "iTerm2"\n'
+              '  set out to ""\n'
+              '  repeat with w in windows\n'
+              '    set out to out & "W" & (character id 9) & (id of w) & (character id 9) & (name of w) & linefeed\n'
+              '    repeat with t in tabs of w\n'
+              '      set out to out & "T" & linefeed\n'
+              '      repeat with s in sessions of t\n'
+              '        set out to out & "S" & (character id 9) & (tty of s) & linefeed\n'
+              '      end repeat\n'
+              '    end repeat\n'
+              '  end repeat\n'
+              '  return out\n'
+              'end tell')
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    wins = []
+    for line in r.stdout.splitlines():
+        kind, _, rest = line.partition("\t")
+        if kind == "W":
+            wid, _, name = rest.partition("\t")
+            wins.append({"id": int(wid), "name": name.strip(), "tabs": []})
+        elif kind == "T" and wins:
+            wins[-1]["tabs"].append([])
+        elif kind == "S" and wins and wins[-1]["tabs"]:
+            wins[-1]["tabs"][-1].append(rest.strip())
+    return wins
+
+
+def build_windows(live):
+    """Window names and tab counts, plus where each live session sits."""
+    by_tty = {s["tty"]: s["sessionId"] for s in live if s.get("tty")}
+    out = []
+    for w in iterm_windows():
+        out.append({
+            "name": w["name"],
+            "tabCount": len(w["tabs"]),
+            "sessions": [{"sessionId": by_tty[tty], "tab": ti, "pane": pi}
+                         for ti, panes in enumerate(w["tabs"], start=1)
+                         for pi, tty in enumerate(panes, start=1) if tty in by_tty],
+        })
+    return out
+
+
+def iterm_prefs_paths():
+    """iTerm2 can load its settings from a custom folder (Settings > General >
+    Settings), and then the copy in ~/Library may be stale. Check that first."""
+    paths = []
+    r = subprocess.run(["defaults", "read", "com.googlecode.iterm2", "LoadPrefsFromCustomFolder"],
+                       capture_output=True, text=True)
+    if r.stdout.strip() == "1":
+        f = subprocess.run(["defaults", "read", "com.googlecode.iterm2", "PrefsCustomFolder"],
+                           capture_output=True, text=True).stdout.strip()
+        if f:
+            paths.append(os.path.join(os.path.expanduser(f), PREFS_NAME))
+    return paths + [DEFAULT_PREFS]
+
+
+def saved_arrangement():
+    """(window names, tab counts) of the claude-sessions arrangement, or None."""
+    for path in iterm_prefs_paths():
+        if not os.path.exists(path):
+            continue
+        with open(path, "rb") as fh:
+            arr = plistlib.load(fh).get("Window Arrangements", {}).get(ARRANGEMENT)
+        if arr:
+            return [(w.get("Title Override") or "", len(w.get("Tabs", []))) for w in arr]
+    return None
+
+
+def tty_runs_claude(tty):
+    """Never type into a tab that already has Claude running."""
+    r = subprocess.run(["ps", "-t", tty.replace("/dev/", ""), "-o", "comm="],
+                       capture_output=True, text=True)
+    return any(os.path.basename(c.strip()) == "claude" for c in r.stdout.splitlines())
+
+
+def same_start(registry, ps_start):
+    """The registry records procStart in UTC, ps reports local time, so allow a
+    whole-hour offset. Comparing dates alone dropped every session started
+    in the evening for anyone west of UTC."""
+    fmt = "%a %b %d %H:%M:%S %Y"
+    try:
+        a = datetime.strptime(" ".join(registry.split()), fmt)
+        b = datetime.strptime(" ".join(ps_start.split()), fmt)
+    except ValueError:
+        return registry.split()[0:3] == ps_start.split()[0:3]
+    delta = abs((a - b).total_seconds())
+    return delta <= 15 * 3600 and min(delta % 3600, 3600 - delta % 3600) < 2
+
+
+def collect():
+    """Read ~/.claude/sessions and keep the entries whose process is still alive."""
+    live, stale = [], 0
+    for name in sorted(os.listdir(REGISTRY)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(REGISTRY, name)) as fh:
+                d = json.load(fh)
+        except (ValueError, OSError):
+            continue
+        pid = d.get("pid")
+        sid = d.get("sessionId")
+        if not pid or not sid:
+            continue
+        started = proc_start(pid)
+        if not started:
+            stale += 1
+            continue
+        # A recycled pid would report a different start time than the registry.
+        if d.get("procStart") and not same_start(d["procStart"], started):
+            stale += 1
+            continue
+        live.append({
+            "pid": pid,
+            "sessionId": sid,
+            "cwd": d.get("cwd") or os.path.expanduser("~"),
+            "name": d.get("name") or sid[:8],
+            "kind": d.get("kind", "interactive"),
+            "status": d.get("status"),
+            "version": d.get("version"),
+            "procStart": started,
+            "tty": proc_tty(pid),
+            "hasTranscript": transcript_exists(sid),
+            "iterm": iterm_position(pid),
+        })
+    live.sort(key=lambda s: (s["iterm"]["window"] if s["iterm"] else 99,
+                             s["iterm"]["tab"] if s["iterm"] else 999))
+    return live, stale
+
+
+def cmd_snapshot(args):
+    live, stale = collect()
+    if not live:
+        sys.exit("No live Claude sessions found.")
+    stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    path = os.path.join(SNAP_DIR, f"{stamp}.json")
+    manifest = {
+        "capturedAt": datetime.now().isoformat(timespec="seconds"),
+        "sessions": live,
+        "windows": build_windows(live),
+    }
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    latest = os.path.join(SNAP_DIR, "latest.json")
+    if os.path.islink(latest) or os.path.exists(latest):
+        os.remove(latest)
+    os.symlink(path, latest)
+    n_int = sum(1 for s in live if s["kind"] == "interactive")
+    print(f"Wrote {path}")
+    print(f"{len(manifest['windows'])} windows captured.")
+    live_shape = [(w["name"], w["tabCount"]) for w in manifest["windows"]]
+    saved = saved_arrangement()
+    if saved is None:
+        print(f"WARNING: no '{ARRANGEMENT}' window arrangement saved. Save one "
+              "(Window > Save Window Arrangement) or groups and window names won't come back.")
+    elif sorted(saved) != sorted(live_shape):  # AppleScript lists windows front to back
+        print(f"WARNING: the '{ARRANGEMENT}' arrangement doesn't match the open windows. "
+              "Re-save it (Window > Save Window Arrangement) so tabs line up on restore.")
+    else:
+        print(f"'{ARRANGEMENT}' arrangement matches the open windows.")
+    no_tx = [s for s in live if not s["hasTranscript"]]
+    print(f"{len(live)} live sessions: {n_int} interactive, {len(live) - n_int} background."
+          + (f" Skipped {stale} stale registry entries." if stale else ""))
+    if no_tx:
+        print(f"{len(no_tx)} have no transcript yet and will reopen as a fresh session "
+              "in the same directory:")
+        for s in no_tx:
+            print(f"  {s['name']}")
+    return manifest
+
+
+def load_manifest(path):
+    if not path:
+        path = os.path.join(SNAP_DIR, "latest.json")
+    if not os.path.exists(path):
+        sys.exit(f"No snapshot at {path}. Run `deja-tab snapshot` first.")
+    with open(path) as fh:
+        return json.load(fh), os.path.realpath(path)
+
+
+def cmd_list(args):
+    m, path = load_manifest(args.manifest)
+    print(f"{path}  (captured {m['capturedAt']})")
+    print("  ! = no transcript on disk; reopens as a fresh session\n")
+    home = os.path.expanduser("~")
+    for s in m["sessions"]:
+        pos = s["iterm"]
+        where = f"w{pos['window']}t{pos['tab']}" if pos else "-"
+        cwd = s["cwd"].replace(home, "~")
+        tty = (s.get('tty') or '-').replace('/dev/', '')
+        tx = ' ' if s.get('hasTranscript', True) else '!'
+        print(f"  {tx} {where:<7} {tty:<9} {s['kind']:<12} {s['name']:<42} {cwd}")
+
+
+def applescript_escape(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def osa(script):
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"osascript failed: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def resume_cmd(s):
+    if s.get("hasTranscript", True):
+        return f"{UNSET_INHERITED}cd {shell_quote(s['cwd'])} && claude --resume {s['sessionId']}", ""
+    return f"{UNSET_INHERITED}cd {shell_quote(s['cwd'])} && claude", "  (no transcript; fresh session)"
+
+
+def restore_into_arrangement(args, m, path):
+    """Resume each session in its tab of the already-restored arrangement."""
+    by_id = {x["sessionId"]: x for x in m["sessions"]}
+    live = iterm_windows()
+    used = set()
+    jobs, missing = [], []  # jobs: (window id, tab, pane, tty, cmd, title)
+    seen = set()
+    print(f"Resuming sessions into restored windows, from {os.path.basename(path)}\n")
+    for w in m["windows"]:
+        if not w["sessions"]:
+            continue
+        # Exact, case-sensitive name match: "Financia" and "FINANCIA" are different windows.
+        # When a name is open twice (iTerm2 restored windows on launch, then the
+        # arrangement restored them again), prefer the copy already running claude
+        # so its tabs get skipped, rather than resuming duplicates into the empty
+        # copy (2026-10-10).
+        candidates = [lw for lw in live if lw["name"] == w["name"] and lw["id"] not in used]
+        target = max(candidates, default=None,
+                     key=lambda lw: any(tty_runs_claude(t) for tab in lw["tabs"] for t in tab))
+        if target is None:
+            missing.append(w["name"])
+            continue
+        used.add(target["id"])
+        print(f"  == {w['name']}")
+        if len(target["tabs"]) != w["tabCount"]:
+            print(f"     tab count is {len(target['tabs'])}, snapshot had {w['tabCount']}; "
+                  "tabs may not line up")
+        for e in w["sessions"]:
+            s = by_id.get(e["sessionId"])
+            if not s or e["sessionId"] in seen:
+                continue
+            seen.add(e["sessionId"])
+            try:
+                tty = target["tabs"][e["tab"] - 1][e["pane"] - 1]
+            except IndexError:
+                print(f"     [{s['name']}] tab {e['tab']} pane {e['pane']} doesn't exist; skipped")
+                continue
+            if tty_runs_claude(tty):
+                print(f"     [{s['name']}] tab {e['tab']} already runs claude; skipped")
+                continue
+            cmd, note = resume_cmd(s)
+            print(f"     tab {e['tab']}: [{s['name']}] {cmd}{note}")
+            jobs.append((target["id"], e["tab"], e["pane"], cmd, session_title(s["sessionId"])))
+    if missing:
+        print(f"\nNo open window named: {', '.join(missing)}")
+    if not jobs:
+        sys.exit(f"\nNothing to resume. Restore the arrangement first: "
+                 f"Window > Restore Window Arrangement > {ARRANGEMENT}")
+    if args.dry_run:
+        print("\nDry run. Nothing was typed.")
+        return
+    for wid, t, p, cmd, _title in jobs:
+        osa('tell application "iTerm2"\n'
+            f'  tell session {p} of tab {t} of window id {wid}\n'
+            f'    write text "{applescript_escape(cmd)}"\n'
+            '  end tell\n'
+            'end tell')
+        time.sleep(args.delay)
+    print(f"\nResumed {len(jobs)} sessions.")
+    named = [(wid, t, p, title) for wid, t, p, _c, title in jobs if title]
+    if named:
+        time.sleep(args.title_delay)
+        lines = "".join(f'  set name of session {p} of tab {t} of window id {wid} '
+                        f'to "{applescript_escape(title)}"\n' for wid, t, p, title in named)
+        osa(f'tell application "iTerm2"\n{lines}end tell')
+        print(f"Named {len(named)} tabs from their session titles.")
+
+
+def cmd_restore(args):
+    m, path = load_manifest(args.manifest)
+    if not m.get("windows"):
+        sys.exit("This snapshot has no window data. Run `deja-tab snapshot` again.")
+    return restore_into_arrangement(args, m, path)
+
+
+def shell_quote(s):
+    """Shell-quote a path for the command line we hand to the tab."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="deja-tab", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("snapshot", help="capture the sessions open right now")
+
+    p_list = sub.add_parser("list", help="show a captured snapshot")
+    p_list.add_argument("manifest", nargs="?")
+
+    p_res = sub.add_parser("restore", help="resume the sessions in their iTerm2 tabs")
+    p_res.add_argument("manifest", nargs="?")
+    p_res.add_argument("--dry-run", action="store_true")
+    p_res.add_argument("--delay", type=float, default=1.5)
+    p_res.add_argument("--title-delay", type=float, default=8,
+                       help="seconds to wait before naming tabs (default 8)")
+
+    args = ap.parse_args()
+    {"snapshot": cmd_snapshot, "list": cmd_list, "restore": cmd_restore}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
